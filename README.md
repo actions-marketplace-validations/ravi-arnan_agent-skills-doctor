@@ -93,6 +93,7 @@ Options:
   --no-global    skip user-level global roots
   --no-project   skip project-level roots
   --root <dir>   extra root to scan (repeatable)
+  --ignore <name> ignore drift for a skill (repeatable)
   -h, --help     show this help text
 ```
 
