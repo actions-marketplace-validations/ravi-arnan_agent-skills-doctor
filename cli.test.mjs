@@ -204,3 +204,56 @@ test('payload tokens calculation and --by payload sorting work properly', () => 
   }
 });
 
+test('cmdCatalog does not report symlinked skills pointing to the same directory as shadowed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-symlink-shadow-'));
+  try {
+    const targetDir = join(root, '.agents/skills/shared');
+    skill(targetDir, 'shared', 'a shared skill');
+    mkdirSync(join(root, '.commandcode/skills'), { recursive: true });
+    symlinkSync(targetDir, join(root, '.commandcode/skills/shared'));
+
+    const result = audit({ project: root, includeGlobal: false });
+    assert.equal(result.cmd.count, 1);
+    assert.equal(result.cmd.shadowed.length, 0);
+    assert.equal(result.duplicates.length, 1);
+    assert.equal(result.duplicates[0].status, 'linked');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('drift detection hashes companion files in the skill directory', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-dir-hash-'));
+  try {
+    const dirA = join(root, '.commandcode/skills/ext');
+    const dirB = join(root, '.agents/skills/ext');
+    skill(dirA, 'ext', 'same SKILL.md');
+    skill(dirB, 'ext', 'same SKILL.md');
+    mkdirSync(join(dirA, 'references'), { recursive: true });
+    mkdirSync(join(dirB, 'references'), { recursive: true });
+    writeFileSync(join(dirA, 'references/guide.md'), 'version 1');
+    writeFileSync(join(dirB, 'references/guide.md'), 'version 2');
+
+    const result = audit({ project: root, includeGlobal: false });
+    assert.equal(result.duplicates.length, 1);
+    assert.equal(result.duplicates[0].status, 'drift');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ignore option marks drifted skill as ignored', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-ignore-'));
+  try {
+    skill(join(root, '.commandcode/skills/harness-skill'), 'harness-skill', 'variant A');
+    skill(join(root, '.agents/skills/harness-skill'), 'harness-skill', 'variant B');
+
+    const result = audit({ project: root, includeGlobal: false, ignore: ['harness-skill'] });
+    assert.equal(result.duplicates.length, 1);
+    assert.equal(result.duplicates[0].status, 'drift');
+    assert.equal(result.duplicates[0].ignored, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+

@@ -91,7 +91,52 @@ function expand(path, project) {
   return isAbsolute(path) ? path : join(project, path);
 }
 
-const hash = (text) => createHash('sha256').update(text.trimEnd()).digest('hex');
+const IGNORED_DIRS = new Set(['.git', 'node_modules']);
+
+// Deterministic hash + latest mtime across the whole skill directory so drift
+// catches changes in companion scripts/references as well as SKILL.md.
+function hashSkillDir(rootDir) {
+  const hasher = createHash('sha256');
+  const visited = new Set();
+  let latestMtime = 0;
+
+  function walkDir(dir, prefix) {
+    const real = safeRealpath(dir);
+    if (visited.has(real)) return;
+    visited.add(real);
+
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (IGNORED_DIRS.has(entry.name) || entry.name === '.DS_Store') continue;
+      const full = join(dir, entry.name);
+      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+      let stats;
+      try {
+        stats = statSync(full);
+      } catch {
+        continue;
+      }
+      if (stats.isDirectory()) {
+        walkDir(full, rel);
+      } else if (stats.isFile()) {
+        hasher.update(`${rel}\0`);
+        try {
+          const buf = readFileSync(full);
+          hasher.update(buf);
+          if (stats.mtimeMs > latestMtime) latestMtime = stats.mtimeMs;
+        } catch {}
+      }
+    }
+  }
+
+  walkDir(rootDir, '');
+  return { hash: hasher.digest('hex'), mtimeMs: latestMtime };
+}
 
 // Only `name` and `description` are read; a full YAML parser is not worth it
 // here. Values are unquoted so `name: "foo"` and `name: foo` behave the same.
@@ -201,13 +246,15 @@ function loadSkill(dir, file) {
   }
   const chars = name.trim().length + description.trim().length;
   const payloadChars = text.length;
+  const dirDigest = hashSkillDir(dir);
   return {
     name: name.trim() || dirName,
     declaredName: name.trim(),
     dir,
     path: join(dir, file),
     description: description.trim(),
-    hash: hash(text),
+    hash: dirDigest.hash,
+    mtimeMs: dirDigest.mtimeMs,
     chars,
     tokens: Math.ceil(chars / 4),
     payloadChars,
@@ -302,6 +349,7 @@ export function findDuplicates(roots) {
         path: skill.path || skill.dir,
         dir: skill.dir,
         hash: skill.hash,
+        mtimeMs: skill.mtimeMs || 0,
         real: safeRealpath(skill.dir),
         linked: skill.linked,
       });
@@ -359,11 +407,15 @@ export function cmdCatalog(project, { includeUser = true } = {}) {
   const shadowed = [];
   for (const root of roots) {
     for (const skill of root.skills) {
+      const real = safeRealpath(skill.dir);
       if (winners.has(skill.name)) {
-        shadowed.push({ name: skill.name, kept: winners.get(skill.name).root, dropped: root.rel });
+        const winner = winners.get(skill.name);
+        if (winner.real !== real) {
+          shadowed.push({ name: skill.name, kept: winner.root, dropped: root.rel });
+        }
         continue;
       }
-      winners.set(skill.name, { skill, root: root.rel });
+      winners.set(skill.name, { skill, root: root.rel, real });
     }
   }
   const entries = [...winners.values()];
@@ -442,7 +494,10 @@ export function audit(options = {}) {
   );
   const scanned = roots.map((root) => scanRoot(root, project));
   const present = scanned.filter((root) => root.exists);
-  const duplicates = findDuplicates(present);
+  const ignored = new Set(options.ignore || []);
+  const duplicates = findDuplicates(present).map((d) =>
+    ignored.has(d.name) ? { ...d, ignored: true } : d,
+  );
   const cmd = cmdCatalog(project, { includeUser: options.includeGlobal !== false });
   const invalid = present.flatMap((root) =>
     root.skills.filter((s) => s.problems.length).map((s) => ({ root: root.rel, dir: s.dir, name: s.name, problems: s.problems })),
@@ -480,20 +535,29 @@ function pct(tokens, window) {
   return `${((tokens / window) * 100).toFixed(1)}%`;
 }
 
+function formatDate(ms) {
+  if (!ms) return '';
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
 function groupByHash(copies) {
   const groups = new Map();
   for (const copy of copies) {
-    const group = groups.get(copy.hash) || { hash: copy.hash, roots: [] };
-    groups.set(copy.hash, { hash: copy.hash, roots: [...group.roots, copy.root] });
+    const group = groups.get(copy.hash) || { hash: copy.hash, roots: [], mtimeMs: 0 };
+    groups.set(copy.hash, {
+      hash: copy.hash,
+      roots: [...group.roots, copy.root],
+      mtimeMs: Math.max(group.mtimeMs, copy.mtimeMs || 0),
+    });
   }
-  return [...groups.values()].sort((a, b) => b.roots.length - a.roots.length);
+  return [...groups.values()].sort((a, b) => b.mtimeMs - a.mtimeMs || b.roots.length - a.roots.length);
 }
 
 function report(result) {
   const lines = [];
   const scanned = result.scanned.filter((r) => r.exists);
   const absent = result.scanned.length - scanned.length;
-  const drift = result.duplicates.filter((d) => d.status === 'drift');
+  const drift = result.duplicates.filter((d) => d.status === 'drift' && !d.ignored);
   const identical = result.duplicates.filter((d) => d.status === 'identical');
   const linked = result.duplicates.filter((d) => d.status === 'linked');
 
@@ -580,8 +644,16 @@ function report(result) {
     issues.push(`drift: ${drift.length} skill(s) have copies with different content`);
     for (const d of drift) {
       issues.push(`    ${d.name} (${d.copies.length} copies)`);
-      for (const group of groupByHash(d.copies)) {
-        issues.push(`      [${group.roots.length}] ${group.roots.join(', ')} (${group.hash.slice(0, 8)})`);
+      const groups = groupByHash(d.copies);
+      const maxMtime = Math.max(...groups.map((g) => g.mtimeMs));
+      const minMtime = Math.min(...groups.map((g) => g.mtimeMs));
+      const showNewest = groups.length > 1 && maxMtime - minMtime > 1000;
+      for (const group of groups) {
+        const meta = [group.hash.slice(0, 8)];
+        const date = formatDate(group.mtimeMs);
+        if (date) meta.push(date);
+        if (showNewest && group.mtimeMs === maxMtime) meta.push('newest');
+        issues.push(`      [${group.roots.length}] ${group.roots.join(', ')} (${meta.join(', ')})`);
       }
     }
   }
@@ -623,6 +695,7 @@ function help() {
     '  --no-global    skip user-level global roots',
     '  --no-project   skip project-level roots',
     '  --root <dir>   extra root to scan (repeatable)',
+    '  --ignore <name> ignore drift for a skill (repeatable)',
     '  -h, --help     show this help text',
     '',
     'exit: 0 clean, 1 problems found, 2 usage error',
@@ -630,7 +703,7 @@ function help() {
 }
 
 function parseArgs(argv) {
-  const options = { extraRoots: [] };
+  const options = { extraRoots: [], ignore: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--json') options.json = true;
@@ -648,6 +721,11 @@ function parseArgs(argv) {
       options.by = val;
     }
     else if (arg === '--root') options.extraRoots.push(argv[++i]);
+    else if (arg === '--ignore') {
+      const val = argv[++i];
+      if (!val || val.startsWith('-')) return { error: 'missing value for --ignore' };
+      options.ignore.push(val);
+    }
     else if (arg === '--help' || arg === '-h') options.help = true;
     else return { error: `unknown argument: ${arg}` };
   }
@@ -671,7 +749,7 @@ function main(argv) {
     result.invalid.length +
     result.broken.length +
     (result.missing?.length || 0) +
-    result.duplicates.filter((d) => d.status === 'drift').length;
+    result.duplicates.filter((d) => d.status === 'drift' && !d.ignored).length;
   if (result.budget?.exceeded) count++;
 
   if (options.json) {
