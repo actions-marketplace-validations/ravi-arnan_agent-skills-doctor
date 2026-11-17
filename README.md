@@ -19,7 +19,7 @@ Modern AI agent harnesses discover and load skills dynamically from user and pro
 3. **Skill Drift**: Multiple tools often keep separate copies of the same skill. Edits made in one folder leave other agent environments running stale or conflicting versions.
 4. **Dangling Symlinks**: Deleted or moved skill sources leave broken links that can cause runtime exceptions.
 
-`agent-skills-doctor` performs a fast, read-only audit across all agent directories on your machine, reporting these silent failures and calculating the exact token footprint of your loaded skills catalog.
+`agent-skills-doctor` performs a fast, read-only audit by default across all agent directories on your machine, reporting these silent failures and calculating the exact token footprint of your loaded skills catalog.
 
 ---
 
@@ -80,11 +80,15 @@ skills-doctor
 
 ```text
 usage: skills-doctor [options]
+       skills-doctor diff <skill> [options]
 
 Health check, linter, and token auditor for agent skills across every harness root.
 
 Options:
   --fix          automatically repair safe issues (rename mismatched folders, remove broken links)
+  --sync         replace duplicate/stale skill copies with symlinks to the newest or --prefer root
+  --prefer <root> preferred source root for --sync (e.g. ~/.agents/skills or agents)
+  --dry-run      preview --sync changes without modifying files
   --budget <n>   fail with exit code 1 if metadata exceeds token limit
   --top <n>      display top N skills by token cost
   --by <metric>  metric to sort top skills by: catalog (default) or payload
@@ -93,13 +97,13 @@ Options:
   --no-global    skip user-level global roots
   --no-project   skip project-level roots
   --root <dir>   extra root to scan (repeatable)
-  --ignore <name> ignore drift for a skill (repeatable)
+  --ignore <name> ignore drift/missing/invalid issues for a skill (repeatable)
   -h, --help     show this help text
 ```
 
 ### Exit Codes
-- `0`: Clean tree, no problems found.
-- `1`: Problems detected (invalid skills, broken symlinks, content drift, or exceeded token budget).
+- `0`: Clean tree, no problems found (or `diff` target found).
+- `1`: Problems detected (invalid skills, missing assets, broken symlinks, content drift, exceeded token budget, or `diff` target not found).
 - `2`: Usage or configuration error.
 
 ---
@@ -136,7 +140,7 @@ npx agent-skills-doctor --no-global --budget 4000
 ## Design Principles
 
 - **Zero Dependencies**: Built entirely with Node.js standard library (`node:fs`, `node:crypto`, `node:path`).
-- **Strictly Read-Only**: Never alters, writes, or deletes your files.
+- **Safe by Default**: Strictly read-only unless `--fix` or `--sync` is explicitly passed.
 - **Fast**: Audits thousands of skills across all directories in under 50 milliseconds.
 
 ---

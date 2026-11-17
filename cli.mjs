@@ -26,6 +26,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
 } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,10 +94,8 @@ function expand(path, project) {
 
 const IGNORED_DIRS = new Set(['.git', 'node_modules']);
 
-// Deterministic hash + latest mtime across the whole skill directory so drift
-// catches changes in companion scripts/references as well as SKILL.md.
-function hashSkillDir(rootDir) {
-  const hasher = createHash('sha256');
+function walkSkillFiles(rootDir) {
+  const files = new Map();
   const visited = new Set();
   let latestMtime = 0;
 
@@ -124,10 +123,8 @@ function hashSkillDir(rootDir) {
       if (stats.isDirectory()) {
         walkDir(full, rel);
       } else if (stats.isFile()) {
-        hasher.update(`${rel}\0`);
         try {
-          const buf = readFileSync(full);
-          hasher.update(buf);
+          files.set(rel, readFileSync(full));
           if (stats.mtimeMs > latestMtime) latestMtime = stats.mtimeMs;
         } catch {}
       }
@@ -135,7 +132,19 @@ function hashSkillDir(rootDir) {
   }
 
   walkDir(rootDir, '');
-  return { hash: hasher.digest('hex'), mtimeMs: latestMtime };
+  return { files, mtimeMs: latestMtime };
+}
+
+// Deterministic hash + latest mtime across the whole skill directory so drift
+// catches changes in companion scripts/references as well as SKILL.md.
+function hashSkillDir(rootDir) {
+  const { files, mtimeMs } = walkSkillFiles(rootDir);
+  const hasher = createHash('sha256');
+  for (const [rel, buf] of files) {
+    hasher.update(`${rel}\0`);
+    hasher.update(buf);
+  }
+  return { hash: hasher.digest('hex'), mtimeMs };
 }
 
 // Only `name` and `description` are read; a full YAML parser is not worth it
@@ -500,20 +509,39 @@ export function audit(options = {}) {
   );
   const cmd = cmdCatalog(project, { includeUser: options.includeGlobal !== false });
   const invalid = present.flatMap((root) =>
-    root.skills.filter((s) => s.problems.length).map((s) => ({ root: root.rel, dir: s.dir, name: s.name, problems: s.problems })),
+    root.skills
+      .filter((s) => s.problems.length)
+      .map((s) => ({ root: root.rel, dir: s.dir, name: s.name, problems: s.problems, ignored: ignored.has(s.name) })),
   );
   const broken = present.flatMap((root) => root.broken);
   const missing = present.flatMap((root) =>
     root.skills.flatMap((s) =>
-      s.missing.map((m) => ({ root: root.rel, dir: s.dir, name: s.name, ref: m.ref, type: m.type })),
+      s.missing.map((m) => ({
+        root: root.rel,
+        dir: s.dir,
+        name: s.name,
+        ref: m.ref,
+        type: m.type,
+        ignored: ignored.has(s.name),
+      })),
     ),
   );
 
+  let fixes = [];
   if (options.fix) {
-    const fixes = applyFixes({ invalid, broken });
+    fixes = applyFixes({ invalid: invalid.filter((s) => !s.ignored), broken });
     if (fixes.length) {
       const rescanned = audit({ ...options, fix: false });
       return { ...rescanned, fixes };
+    }
+  }
+
+  let syncs = [];
+  if (options.sync) {
+    syncs = applySync(duplicates, { prefer: options.prefer, dryRun: options.dryRun, project });
+    if (syncs.some((s) => s.action === 'linked') && !options.dryRun) {
+      const rescanned = audit({ ...options, sync: false });
+      return { ...rescanned, fixes, syncs };
     }
   }
 
@@ -526,7 +554,132 @@ export function audit(options = {}) {
     };
   }
 
-  return { project, scanned, duplicates, cmd, invalid, broken, missing, budget, fixes: [], options };
+  return { project, scanned, duplicates, cmd, invalid, broken, missing, budget, fixes, syncs, options };
+}
+
+export function applySync(duplicates, { prefer, dryRun = false, project = process.cwd() } = {}) {
+  const syncs = [];
+  const preferTarget = prefer ? safeRealpath(expand(prefer, project)) : null;
+
+  for (const dup of duplicates) {
+    if (dup.ignored || dup.status === 'linked') continue;
+    const uniqueDirs = new Map();
+    for (const c of dup.copies) {
+      if (!uniqueDirs.has(c.real)) uniqueDirs.set(c.real, c);
+    }
+    if (uniqueDirs.size < 2) continue;
+
+    const candidates = [...uniqueDirs.values()];
+    let source = null;
+    if (prefer) {
+      source = dup.copies.find(
+        (c) =>
+          c.root === prefer ||
+          c.label === prefer ||
+          safeRealpath(expand(c.root, project)) === preferTarget,
+      );
+      if (!source) continue;
+      source = uniqueDirs.get(source.real) || source;
+    } else {
+      candidates.sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0));
+      source = candidates[0];
+    }
+
+    for (const copy of dup.copies) {
+      if (copy.real === source.real) continue;
+      if (dryRun) {
+        syncs.push({ action: 'would_link', name: dup.name, from: copy.dir, to: source.real });
+        continue;
+      }
+      try {
+        rmSync(copy.dir, { recursive: true, force: true });
+        symlinkSync(source.real, copy.dir, 'dir');
+        syncs.push({ action: 'linked', name: dup.name, from: copy.dir, to: source.real });
+      } catch (err) {
+        syncs.push({ action: 'error', name: dup.name, from: copy.dir, to: source.real, error: err.message });
+      }
+    }
+  }
+  return syncs;
+}
+
+function listSkillFiles(rootDir) {
+  return walkSkillFiles(rootDir).files;
+}
+
+function previewTextDiff(bufA, bufB, maxLines = 10) {
+  if (bufA.length > 65536 || bufB.length > 65536) return [];
+  const aLines = bufA.toString('utf8').replace(/\r\n/g, '\n').split('\n');
+  const bLines = bufB.toString('utf8').replace(/\r\n/g, '\n').split('\n');
+  const aSet = new Set(aLines);
+  const bSet = new Set(bLines);
+  const out = [];
+  for (const line of aLines) {
+    if (!bSet.has(line) && line.trim()) {
+      out.push(`- ${line}`);
+      if (out.length >= maxLines) break;
+    }
+  }
+  for (const line of bLines) {
+    if (!aSet.has(line) && line.trim()) {
+      out.push(`+ ${line}`);
+      if (out.length >= maxLines * 2) break;
+    }
+  }
+  return out;
+}
+
+export function diffSkill(result, skillName) {
+  const copies = [];
+  for (const root of result.scanned) {
+    if (!root.exists) continue;
+    for (const s of root.skills) {
+      if (s.name === skillName) {
+        copies.push({ root: root.rel, dir: s.dir, hash: s.hash, mtimeMs: s.mtimeMs || 0, real: safeRealpath(s.dir) });
+      }
+    }
+  }
+  if (!copies.length) return { found: false, lines: [`skill "${skillName}" not found`] };
+  const groups = groupByHash(copies);
+  if (groups.length === 1) {
+    const oneDir = new Set(copies.map((c) => c.real)).size === 1;
+    const noun = copies.length === 1 ? 'copy' : 'copies';
+    return {
+      found: true,
+      drifted: false,
+      lines: [`${skillName}: ${copies.length} ${noun}, all ${oneDir ? 'linked to one directory' : 'identical'} (${groups[0].hash.slice(0, 8)})`],
+    };
+  }
+
+  const base = groups[0];
+  const baseCopy = copies.find((c) => c.hash === base.hash);
+  const baseFiles = listSkillFiles(baseCopy.dir);
+  const lines = [`${skillName} (${copies.length} copies, ${groups.length} variants)`];
+  const baseDate = formatDate(base.mtimeMs);
+  lines.push(`  base (newest): [${base.roots.length}] ${base.roots.join(', ')} (${base.hash.slice(0, 8)}${baseDate ? `, ${baseDate}` : ''})`);
+
+  for (let i = 1; i < groups.length; i++) {
+    const grp = groups[i];
+    const grpCopy = copies.find((c) => c.hash === grp.hash);
+    const grpFiles = listSkillFiles(grpCopy.dir);
+    const grpDate = formatDate(grp.mtimeMs);
+    lines.push(`  variant ${i}: [${grp.roots.length}] ${grp.roots.join(', ')} (${grp.hash.slice(0, 8)}${grpDate ? `, ${grpDate}` : ''})`);
+
+    const allPaths = new Set([...baseFiles.keys(), ...grpFiles.keys()]);
+    for (const rel of [...allPaths].sort()) {
+      const a = grpFiles.get(rel);
+      const b = baseFiles.get(rel);
+      if (!a) lines.push(`    added in base: ${rel}`);
+      else if (!b) lines.push(`    removed in base: ${rel}`);
+      else if (!a.equals(b)) {
+        lines.push(`    modified: ${rel}`);
+        if (/\.(?:md|txt|sh|py|js|mjs|json|ya?ml)$/i.test(rel)) {
+          for (const dLine of previewTextDiff(a, b)) lines.push(`      ${dLine}`);
+        }
+      }
+    }
+  }
+  return { found: true, drifted: true, lines };
 }
 
 // ------------------------------------------------------------------- report
@@ -619,22 +772,35 @@ function report(result) {
     }
   }
 
+  if (result.syncs?.length) {
+    const label = result.options?.dryRun ? 'sync preview (dry-run)' : 'sync applied';
+    lines.push('');
+    lines.push(`${label}: ${result.syncs.length}`);
+    for (const s of result.syncs) {
+      if (s.action === 'error') lines.push(`  error ${s.name}: ${s.from} -> ${s.to} (${s.error})`);
+      else lines.push(`  ${s.name}: ${s.from} -> ${s.to}`);
+    }
+  }
+
+  const invalid = result.invalid.filter((s) => !s.ignored);
+  const missing = (result.missing || []).filter((m) => !m.ignored);
+
   const issues = [];
   let count = 0;
-  if (result.invalid.length) {
-    count += result.invalid.length;
-    issues.push(`invalid: ${result.invalid.length} skill(s) the harness skips`);
-    for (const s of result.invalid) issues.push(`    ${s.dir}: ${s.problems.join('; ')}`);
+  if (invalid.length) {
+    count += invalid.length;
+    issues.push(`invalid: ${invalid.length} skill(s) the harness skips`);
+    for (const s of invalid) issues.push(`    ${s.dir}: ${s.problems.join('; ')}`);
   }
   if (result.broken.length) {
     count += result.broken.length;
     issues.push(`broken: ${result.broken.length} dangling symlink(s)`);
     for (const b of result.broken) issues.push(`    ${b.path} -> ${b.target}`);
   }
-  if (result.missing?.length) {
-    count += result.missing.length;
-    issues.push(`missing: ${result.missing.length} referenced companion asset(s) not found on disk`);
-    for (const m of result.missing) {
+  if (missing.length) {
+    count += missing.length;
+    issues.push(`missing: ${missing.length} referenced companion asset(s) not found on disk`);
+    for (const m of missing) {
       const desc = m.type === 'link' ? 'broken markdown link' : 'missing script or companion file';
       issues.push(`    ${m.dir}: references "${m.ref}" (${desc})`);
     }
@@ -682,11 +848,15 @@ function report(result) {
 function help() {
   return [
     'usage: skills-doctor [options]',
+    '       skills-doctor diff <skill> [options]',
     '',
     'Health check, linter, and token auditor for agent skills across every harness root.',
     '',
     'Options:',
     '  --fix          automatically repair safe issues (rename mismatched folders, remove broken links)',
+    '  --sync         replace duplicate/stale skill copies with symlinks to the newest or --prefer root',
+    '  --prefer <root> preferred source root for --sync (e.g. ~/.agents/skills or agents)',
+    '  --dry-run      preview --sync changes without modifying files',
     '  --budget <n>   fail with exit code 1 if metadata exceeds token limit',
     '  --top <n>      display top N skills by token cost',
     '  --by <metric>  metric to sort top skills by: catalog (default) or payload',
@@ -695,7 +865,7 @@ function help() {
     '  --no-global    skip user-level global roots',
     '  --no-project   skip project-level roots',
     '  --root <dir>   extra root to scan (repeatable)',
-    '  --ignore <name> ignore drift for a skill (repeatable)',
+    '  --ignore <name> ignore drift/missing/invalid issues for a skill (repeatable)',
     '  -h, --help     show this help text',
     '',
     'exit: 0 clean, 1 problems found, 2 usage error',
@@ -706,8 +876,21 @@ function parseArgs(argv) {
   const options = { extraRoots: [], ignore: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--json') options.json = true;
+    if (arg === 'diff' && !options.command) {
+      const target = argv[++i];
+      if (!target || target.startsWith('-')) return { error: 'missing skill name for diff' };
+      options.command = 'diff';
+      options.targetSkill = target;
+    }
+    else if (arg === '--json') options.json = true;
     else if (arg === '--fix') options.fix = true;
+    else if (arg === '--sync') options.sync = true;
+    else if (arg === '--dry-run') options.dryRun = true;
+    else if (arg === '--prefer') {
+      const val = argv[++i];
+      if (!val || val.startsWith('-')) return { error: 'missing value for --prefer' };
+      options.prefer = val;
+    }
     else if (arg === '--no-global') options.includeGlobal = false;
     else if (arg === '--no-project') options.includeProject = false;
     else if (arg === '--project') options.project = argv[++i];
@@ -745,10 +928,17 @@ function main(argv) {
   }
 
   const result = audit(options);
+  if (options.command === 'diff') {
+    const d = diffSkill(result, options.targetSkill);
+    if (options.json) console.log(JSON.stringify(d, null, 2));
+    else console.log(d.lines.join('\n'));
+    return d.found ? 0 : 1;
+  }
+
   let count =
-    result.invalid.length +
+    result.invalid.filter((s) => !s.ignored).length +
     result.broken.length +
-    (result.missing?.length || 0) +
+    (result.missing || []).filter((m) => !m.ignored).length +
     result.duplicates.filter((d) => d.status === 'drift' && !d.ignored).length;
   if (result.budget?.exceeded) count++;
 

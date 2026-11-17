@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { audit, findMissingReferences, parseFrontmatter, validate } from './cli.mjs';
+import { audit, diffSkill, findMissingReferences, parseFrontmatter, validate } from './cli.mjs';
 
 function skill(dir, name, description) {
   mkdirSync(dir, { recursive: true });
@@ -252,6 +252,112 @@ test('ignore option marks drifted skill as ignored', () => {
     assert.equal(result.duplicates.length, 1);
     assert.equal(result.duplicates[0].status, 'drift');
     assert.equal(result.duplicates[0].ignored, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ignore option also marks missing and invalid issues as ignored', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-ignore-all-'));
+  try {
+    const dir = join(root, '.commandcode/skills/sys-skill');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'SKILL.md'),
+      '---\nname: sys-skill\ndescription: has missing ref\n---\n\nRun `scripts/missing.sh`.',
+    );
+    skill(join(root, '.agents/skills/wrong-dir'), 'sys-skill', 'mismatch');
+
+    const result = audit({ project: root, includeGlobal: false, ignore: ['sys-skill'] });
+    assert.equal(result.missing.length, 1);
+    assert.equal(result.missing[0].ignored, true);
+    assert.equal(result.invalid.length, 1);
+    assert.equal(result.invalid[0].ignored, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('diffSkill reports modified and added files between variants', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-diff-'));
+  try {
+    const dirA = join(root, '.commandcode/skills/sample');
+    const dirB = join(root, '.agents/skills/sample');
+    skill(dirA, 'sample', 'desc A');
+    skill(dirB, 'sample', 'desc B');
+    mkdirSync(join(dirB, 'references'), { recursive: true });
+    writeFileSync(join(dirB, 'references/extra.md'), 'extra');
+
+    const result = audit({ project: root, includeGlobal: false });
+    const diff = diffSkill(result, 'sample');
+    assert.equal(diff.found, true);
+    assert.equal(diff.drifted, true);
+    const output = diff.lines.join('\n');
+    assert.match(output, /modified: SKILL\.md/);
+    assert.match(output, /extra\.md/);
+
+    const missing = diffSkill(result, 'does-not-exist');
+    assert.equal(missing.found, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sync replaces duplicate copies with symlinks and supports dry-run', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-sync-'));
+  try {
+    const dirA = join(root, '.commandcode/skills/syncme');
+    const dirB = join(root, '.agents/skills/syncme');
+    skill(dirA, 'syncme', 'old');
+    skill(dirB, 'syncme', 'new');
+
+    const preview = audit({
+      project: root,
+      includeGlobal: false,
+      sync: true,
+      prefer: '.agents/skills',
+      dryRun: true,
+      budget: 5000,
+    });
+    assert.equal(preview.syncs.length, 1);
+    assert.equal(preview.syncs[0].action, 'would_link');
+    assert.equal(preview.budget?.limit, 5000);
+    assert.equal(lstatSync(dirA).isSymbolicLink(), false);
+
+    // Unmatched --prefer should safely skip rather than falling back to deleting another copy
+    const unmatched = audit({
+      project: root,
+      includeGlobal: false,
+      sync: true,
+      prefer: 'non-existent-root',
+    });
+    assert.equal(unmatched.syncs.length, 0);
+    assert.equal(lstatSync(dirA).isSymbolicLink(), false);
+
+    // Expanded absolute path in --prefer (simulating shell expansion of ~) should match
+    const applied = audit({
+      project: root,
+      includeGlobal: false,
+      sync: true,
+      prefer: join(root, '.agents/skills'),
+    });
+    assert.equal(applied.syncs.length, 1);
+    assert.equal(applied.syncs[0].action, 'linked');
+    assert.equal(lstatSync(dirA).isSymbolicLink(), true);
+    assert.equal(applied.duplicates[0].status, 'linked');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fix respects --ignore for invalid skills', () => {
+  const root = mkdtempSync(join(tmpdir(), 'skills-doctor-fix-ignore-'));
+  try {
+    const wrongDir = join(root, '.agents/skills/wrong-dir');
+    skill(wrongDir, 'ignored-skill', 'desc');
+    const result = audit({ project: root, includeGlobal: false, fix: true, ignore: ['ignored-skill'] });
+    assert.equal(result.fixes.length, 0);
+    assert.equal(lstatSync(wrongDir).isDirectory(), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
